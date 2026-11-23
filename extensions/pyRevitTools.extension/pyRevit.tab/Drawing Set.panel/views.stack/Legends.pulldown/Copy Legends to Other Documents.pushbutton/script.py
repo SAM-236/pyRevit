@@ -1377,6 +1377,35 @@ class CopyUseDestination(DB.IDuplicateTypeNamesHandler):
         return DB.DuplicateTypeAction.UseDestinationTypes
 
 
+class WarningCollector(DB.IFailuresPreprocessor):
+    """Collect and dismiss Revit warnings raised while committing a legend.
+
+    Duplicate-type renames from copying groups and nested families cannot be
+    redirected to destination definitions through the API, so their warnings
+    are recorded for the report instead of interrupting the user. Errors are
+    left untouched and still fail the transaction.
+    """
+
+    def __init__(self):
+        self.messages = []
+
+    def PreprocessFailures(self, failures_accessor):
+        for message in failures_accessor.GetFailureMessages():
+            if message.GetSeverity() == DB.FailureSeverity.Warning:
+                self.messages.append(message.GetDescriptionText())
+                failures_accessor.DeleteWarning(message)
+
+        return DB.FailureProcessingResult.Continue
+
+
+def attach_warning_collector(transaction):
+    collector = WarningCollector()
+    options = transaction.GetFailureHandlingOptions()
+    options.SetFailuresPreprocessor(collector)
+    transaction.SetFailureHandlingOptions(options)
+    return collector
+
+
 def can_duplicate_legend(view):
     try:
         return view.CanViewBeDuplicated(DB.ViewDuplicateOption.Duplicate)
@@ -1452,6 +1481,7 @@ def main():
 
     result_rows = []
     override_failure_rows = []
+    revit_warning_rows = []
     skipped_element_rows = []
 
     current_operation = 0
@@ -1658,6 +1688,7 @@ def main():
                         "Copy legend and graphic overrides",
                     )
                     transaction.Start()
+                    warning_collector = attach_warning_collector(transaction)
 
                     copied_ids = []
                     reference_plane_pairs = []
@@ -1904,6 +1935,16 @@ def main():
 
                         destination_had_commit = True
 
+                        warning_counts = defaultdict(int)
+
+                        for warning_text in warning_collector.messages:
+                            warning_counts[warning_text] += 1
+
+                        for warning_text, count in sorted(warning_counts.items()):
+                            revit_warning_rows.append(
+                                [dest_doc.Title, new_name, str(count), warning_text]
+                            )
+
                         if failed_override_count:
                             warning_count += 1
                             result_label = "Copied with warnings"
@@ -2015,6 +2056,18 @@ def main():
                 "Failure",
             ],
             title="Graphic and Recreation Failures",
+        )
+
+    if revit_warning_rows:
+        output.print_table(
+            table_data=revit_warning_rows,
+            columns=[
+                "Destination",
+                "Legend",
+                "Count",
+                "Warning",
+            ],
+            title="Revit Warnings Dismissed",
         )
 
     if skipped_element_rows:
