@@ -1414,7 +1414,14 @@ def is_skipped_category(element):
     family only drags renamed View Title families into the destination. Like
     view-internal elements, they are not reported.
     """
-    category_value = id_value(element.Category.Id)
+    return is_skipped_category_id(element.Category.Id)
+
+
+def is_skipped_category_id(category_id):
+    if category_id is None:
+        return False
+
+    category_value = id_value(category_id)
 
     for name in SKIPPED_BUILT_IN_CATEGORY_NAMES:
         built_in = getattr(DB.BuiltInCategory, name, None)
@@ -1468,12 +1475,48 @@ class WarningCollector(DB.IFailuresPreprocessor):
         self.messages = []
 
     def PreprocessFailures(self, failures_accessor):
+        doc = failures_accessor.GetDocument()
+
         for message in failures_accessor.GetFailureMessages():
             if message.GetSeverity() == DB.FailureSeverity.Warning:
-                self.messages.append(message.GetDescriptionText())
+                if not concerns_only_skipped_categories(doc, message):
+                    self.messages.append(message.GetDescriptionText())
+
                 failures_accessor.DeleteWarning(message)
 
         return DB.FailureProcessingResult.Continue
+
+
+def element_category_id(element):
+    if isinstance(element, DB.Family):
+        family_category = element.FamilyCategory
+        return family_category.Id if family_category else None
+
+    category = element.Category
+    return category.Id if category else None
+
+
+def concerns_only_skipped_categories(doc, message):
+    """Tell whether a warning is only about families or types of skipped categories.
+
+    Revit loads View Title families as dependencies of other copied types (for
+    example section types), so their rename warnings are dropped unreported.
+    """
+    try:
+        failing_ids = list(message.GetFailingElementIds())
+    except Exception:
+        return False
+
+    if not failing_ids:
+        return False
+
+    for failing_id in failing_ids:
+        element = doc.GetElement(failing_id)
+
+        if element is None or not is_skipped_category_id(element_category_id(element)):
+            return False
+
+    return True
 
 
 def attach_warning_collector(transaction):
