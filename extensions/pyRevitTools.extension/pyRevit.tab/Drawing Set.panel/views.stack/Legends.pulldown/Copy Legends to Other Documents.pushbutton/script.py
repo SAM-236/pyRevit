@@ -127,6 +127,59 @@ def element_signature(element, view):
     )
 
 
+def relaxed_signature(signature):
+    if signature is None:
+        return None
+
+    class_name, category_id, _, _, _, curve, location, bbox = signature
+    return class_name, category_id, curve, location, bbox
+
+
+def pair_equal_signature_groups(source_signatures, destination_signatures):
+    source_groups = defaultdict(list)
+    destination_groups = defaultdict(list)
+
+    for element_id, signature in source_signatures:
+        source_groups[signature].append(element_id)
+
+    for element_id, signature in destination_signatures:
+        destination_groups[signature].append(element_id)
+
+    pairs = []
+    unmatched_source_values = set()
+    matched_destination_values = set()
+
+    for signature, grouped_source_ids in source_groups.items():
+        grouped_destination_ids = destination_groups.get(signature, [])
+
+        if signature is not None and len(grouped_source_ids) == len(
+            grouped_destination_ids
+        ):
+            for source_id, destination_id in zip(
+                sorted(grouped_source_ids, key=id_value),
+                sorted(grouped_destination_ids, key=id_value),
+            ):
+                pairs.append((source_id, destination_id))
+                matched_destination_values.add(id_value(destination_id))
+        else:
+            unmatched_source_values.update(
+                id_value(source_id) for source_id in grouped_source_ids
+            )
+
+    remaining_sources = [
+        (element_id, signature)
+        for element_id, signature in source_signatures
+        if id_value(element_id) in unmatched_source_values
+    ]
+    remaining_destinations = [
+        (element_id, signature)
+        for element_id, signature in destination_signatures
+        if id_value(element_id) not in matched_destination_values
+    ]
+
+    return pairs, remaining_sources, remaining_destinations
+
+
 def match_copied_elements(
     source_doc,
     source_view,
@@ -136,6 +189,10 @@ def match_copied_elements(
     destination_ids,
 ):
     """Pair copied elements with their sources by geometry and content.
+
+    Matching runs in two passes: first on the full signature, then, for the
+    leftovers only, on a relaxed signature that ignores type, family and text
+    names (``CopyElements`` may rename duplicate group or element types).
 
     Returns:
         tuple: ``(pairs, unmatched_source_ids)``.
@@ -147,42 +204,41 @@ def match_copied_elements(
         indistinguishable, so any pairing between them is equivalent. All
         other source elements are returned as unmatched instead of raising.
     """
-    source_groups = defaultdict(list)
-    destination_groups = defaultdict(list)
-
-    for source_id in source_ids:
-        element = source_doc.GetElement(source_id)
-        signature = element_signature(element, source_view)
-        source_groups[signature].append(source_id)
-
-    for destination_id in destination_ids:
-        element = destination_doc.GetElement(destination_id)
-        signature = element_signature(
-            element,
-            destination_view,
+    source_signatures = [
+        (
+            source_id,
+            element_signature(source_doc.GetElement(source_id), source_view),
         )
-        destination_groups[signature].append(destination_id)
-
-    pairs = []
-    unmatched_source_ids = []
-
-    for signature, grouped_source_ids in source_groups.items():
-        grouped_destination_ids = destination_groups.get(
-            signature,
-            [],
+        for source_id in source_ids
+    ]
+    destination_signatures = [
+        (
+            destination_id,
+            element_signature(
+                destination_doc.GetElement(destination_id),
+                destination_view,
+            ),
         )
+        for destination_id in destination_ids
+    ]
 
-        if len(grouped_source_ids) == len(grouped_destination_ids):
-            pairs.extend(
-                zip(
-                    sorted(grouped_source_ids, key=id_value),
-                    sorted(grouped_destination_ids, key=id_value),
-                )
-            )
-        else:
-            unmatched_source_ids.extend(grouped_source_ids)
+    pairs, remaining_sources, remaining_destinations = pair_equal_signature_groups(
+        source_signatures, destination_signatures
+    )
 
-    return pairs, unmatched_source_ids
+    relaxed_pairs, remaining_sources, _ = pair_equal_signature_groups(
+        [
+            (element_id, relaxed_signature(signature))
+            for element_id, signature in remaining_sources
+        ],
+        [
+            (element_id, relaxed_signature(signature))
+            for element_id, signature in remaining_destinations
+        ],
+    )
+    pairs.extend(relaxed_pairs)
+
+    return pairs, [element_id for element_id, _ in remaining_sources]
 
 
 def rounded_number(value):
@@ -434,6 +490,9 @@ def resolve_line_pattern_id(
     if value == id_value(INVALID_ID):
         return INVALID_ID
 
+    if value == id_value(DB.LinePatternElement.GetSolidPatternId()):
+        return DB.LinePatternElement.GetSolidPatternId()
+
     if value < 0:
         return source_id
 
@@ -449,7 +508,16 @@ def resolve_line_pattern_id(
         line_pattern_signature(source_pattern),
         [],
     )
-    destination_id = lowest_id(exact_matches)
+    destination_id = lowest_id(
+        [
+            match_id
+            for match_id in exact_matches
+            if isinstance(
+                pattern_maps["destination_doc"].GetElement(match_id),
+                DB.LinePatternElement,
+            )
+        ]
+    )
 
     if destination_id is None:
         destination_id = clone_line_pattern(
@@ -899,7 +967,21 @@ def copy_line_pattern_property(
                 destination_ogs,
                 "Set" + property_name,
             )
-            setter(destination_pattern_id)
+
+            try:
+                setter(destination_pattern_id)
+            except Exception as error:
+                source_pattern = source_doc.GetElement(source_pattern_id)
+                raise Exception(
+                    "source pattern '{}' ({}) resolved to destination "
+                    "pattern {}: {}".format(
+                        source_pattern.Name if source_pattern else "?",
+                        id_value(source_pattern_id),
+                        id_value(destination_pattern_id),
+                        error,
+                    )
+                )
+
             applied.append(property_name)
     except Exception as error:
         record_override_failure(
@@ -1304,6 +1386,7 @@ def main():
                         if (element and element.Category is not None)
                     )
 
+                    skipped_labels = defaultdict(int)
                     source_ids = []
                     source_reference_planes = []
                     grouped_member_count = 0
@@ -1313,16 +1396,7 @@ def main():
                             continue
 
                         if element.Category is None:
-                            skipped_element_rows.append(
-                                [
-                                    dest_doc.Title,
-                                    legend_name,
-                                    str(id_value(element.Id)),
-                                    "{} has no category and is not copied.".format(
-                                        source_element_label(element)
-                                    ),
-                                ]
-                            )
+                            skipped_labels[source_element_label(element)] += 1
                             continue
 
                         if isinstance(
@@ -1344,6 +1418,23 @@ def main():
                             continue
 
                         source_ids.append(element.Id)
+
+                    if skipped_labels:
+                        skipped_element_rows.append(
+                            [
+                                dest_doc.Title,
+                                legend_name,
+                                str(sum(skipped_labels.values())),
+                                "No category, not copied: {}".format(
+                                    ", ".join(
+                                        "{} x{}".format(label, count)
+                                        for label, count in sorted(
+                                            skipped_labels.items()
+                                        )
+                                    )
+                                ),
+                            ]
+                        )
 
                     if grouped_member_count:
                         logger.info(
@@ -1739,7 +1830,7 @@ def main():
             columns=[
                 "Destination",
                 "Legend",
-                "Element ID",
+                "Count",
                 "Reason",
             ],
             title="Elements Intentionally Skipped",
