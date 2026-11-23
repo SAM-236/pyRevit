@@ -2309,12 +2309,22 @@ def main():
         len(override_failure_rows),
     )
 
+    if ungrouped_reference_plane_rows:
+        summary += (
+            "\n\n{} reference plane(s) were grouped in the source legend. "
+            "The Revit API cannot add elements to an existing group, so they "
+            "were recreated outside their group; regroup them manually if "
+            "needed. See 'Reference Planes to Regroup Manually' in the output "
+            "window.".format(len(ungrouped_reference_plane_rows))
+        )
+
     needs_attention = (
         cancelled
         or warning_count
         or failed_count
         or skipped_count
         or override_failure_rows
+        or ungrouped_reference_plane_rows
     )
 
     if needs_attention:
