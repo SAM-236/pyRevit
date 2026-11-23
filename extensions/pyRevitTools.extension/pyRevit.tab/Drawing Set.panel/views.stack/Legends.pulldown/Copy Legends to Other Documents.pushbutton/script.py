@@ -273,7 +273,56 @@ def match_copied_elements(
         )
         pairs.extend(fallback_pairs)
 
-    return pairs, [element_id for element_id, _ in remaining_sources]
+    sole_pairs, remaining_source_ids = pair_sole_elements_by_class(
+        [element_id for element_id, _ in remaining_sources],
+        [element_id for element_id, _ in remaining_destinations],
+        source_by_value,
+        destination_by_value,
+    )
+    pairs.extend(sole_pairs)
+
+    return pairs, remaining_source_ids
+
+
+def pair_sole_elements_by_class(
+    source_ids,
+    destination_ids,
+    source_by_value,
+    destination_by_value,
+):
+    """Pair leftovers that are the only element of their class and category.
+
+    Covers groups whose copied type differs from the source (for example when
+    a member such as a reference plane could not be copied), which changes
+    their extents and origin.
+    """
+    source_groups = defaultdict(list)
+    destination_groups = defaultdict(list)
+
+    for element_id in source_ids:
+        signature = source_by_value[id_value(element_id)]
+        source_groups[signature[:2] if signature else None].append(element_id)
+
+    for element_id in destination_ids:
+        signature = destination_by_value[id_value(element_id)]
+        destination_groups[signature[:2] if signature else None].append(element_id)
+
+    pairs = []
+    remaining_source_ids = []
+
+    for key, grouped_source_ids in source_groups.items():
+        grouped_destination_ids = destination_groups.get(key, [])
+
+        if (
+            key is not None
+            and len(grouped_source_ids) == 1
+            and len(grouped_destination_ids) == 1
+        ):
+            pairs.append((grouped_source_ids[0], grouped_destination_ids[0]))
+        else:
+            remaining_source_ids.extend(grouped_source_ids)
+
+    return pairs, remaining_source_ids
 
 
 def rounded_number(value):
@@ -355,17 +404,23 @@ def lowest_id(ids):
 
 
 def unique_pattern_name(base_name, names, suffix):
+    """Return a destination-unique pattern name.
+
+    Important:
+        Revit rejects names containing ``{}[]|;<>?`~``, so suffixes use
+        parentheses.
+    """
     if base_name not in names:
         return base_name
 
-    candidate = "{} [{}]".format(
+    candidate = "{} ({})".format(
         base_name,
         suffix,
     )
     index = 2
 
     while candidate in names:
-        candidate = "{} [{} {}]".format(
+        candidate = "{} ({} {})".format(
             base_name,
             suffix,
             index,
@@ -441,10 +496,17 @@ def clone_line_pattern(
     cloned_pattern = DB.LinePattern(new_name)
     cloned_pattern.SetSegments(source_pattern.GetSegments())
 
-    created = DB.LinePatternElement.Create(
-        pattern_maps["destination_doc"],
-        cloned_pattern,
-    )
+    try:
+        created = DB.LinePatternElement.Create(
+            pattern_maps["destination_doc"],
+            cloned_pattern,
+        )
+    except Exception as error:
+        raise Exception(
+            "could not create line pattern '{}' from source '{}': {}".format(
+                new_name, source_pattern_element.Name, error
+            )
+        )
     signature = line_pattern_signature(created)
 
     pattern_maps["line_names"].add(created.Name)
@@ -501,10 +563,17 @@ def clone_fill_pattern(
 
     cloned_pattern.SetFillGrids(cloned_grids)
 
-    created = DB.FillPatternElement.Create(
-        pattern_maps["destination_doc"],
-        cloned_pattern,
-    )
+    try:
+        created = DB.FillPatternElement.Create(
+            pattern_maps["destination_doc"],
+            cloned_pattern,
+        )
+    except Exception as error:
+        raise Exception(
+            "could not create fill pattern '{}' from source '{}': {}".format(
+                new_name, source_pattern_element.Name, error
+            )
+        )
     signature = fill_pattern_signature(created)
 
     pattern_maps["fill_names"].add(created.Name)
@@ -862,6 +931,15 @@ def recreate_reference_planes(
                     destination_reference_plane.Id,
                 )
             )
+
+            if id_value(source_reference_plane.GroupId) != id_value(INVALID_ID):
+                failures.append(
+                    (
+                        source_reference_plane.Id,
+                        "Recreated outside its source group; the Revit API "
+                        "cannot add elements to an existing group.",
+                    )
+                )
         except Exception as error:
             failures.append(
                 (
