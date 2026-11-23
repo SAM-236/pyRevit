@@ -1372,6 +1372,33 @@ def apply_destination_overrides(
     return applied, failures
 
 
+VIEW_INTERNAL_ELEMENT_NAMES = ("ExtentElem",)
+
+
+def is_view_internal_element(element):
+    """Tell whether a category-less element is part of the view itself.
+
+    Every view owns an ``ExtentElem`` and a ``SketchPlane``; skipping them is
+    expected and is not reported to the user.
+    """
+    if isinstance(element, DB.SketchPlane):
+        return True
+
+    return internal_element_label(element) in VIEW_INTERNAL_ELEMENT_NAMES
+
+
+def internal_element_label(element):
+    try:
+        name = element.Name
+    except Exception:
+        name = None
+
+    if element.GetType() == DB.Element and name:
+        return name
+
+    return source_element_label(element)
+
+
 class CopyUseDestination(DB.IDuplicateTypeNamesHandler):
     def OnDuplicateTypeNamesFound(self, args):
         return DB.DuplicateTypeAction.UseDestinationTypes
@@ -1602,7 +1629,8 @@ def main():
                             continue
 
                         if element.Category is None:
-                            skipped_labels[source_element_label(element)] += 1
+                            if not is_view_internal_element(element):
+                                skipped_labels[internal_element_label(element)] += 1
                             continue
 
                         if isinstance(
@@ -1819,7 +1847,7 @@ def main():
                                     "",
                                     "ReferencePlane",
                                     (
-                                        "Reference plane recreation: {}".format(
+                                        "Reference plane: {}".format(
                                             reference_plane_error
                                         )
                                     ),
@@ -1827,9 +1855,7 @@ def main():
                             )
 
                             logger.warning(
-                                "Reference plane %s could not "
-                                "be recreated for legend '%s' "
-                                "in '%s': %s",
+                                "Reference plane %s in legend '%s' for '%s': %s",
                                 id_value(source_reference_plane_id),
                                 legend_name,
                                 dest_doc.Title,
