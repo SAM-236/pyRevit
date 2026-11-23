@@ -2309,10 +2309,19 @@ def main():
         len(override_failure_rows),
     )
 
-    forms.alert(
-        status_message,
-        sub_msg=summary,
+    needs_attention = (
+        cancelled
+        or warning_count
+        or failed_count
+        or skipped_count
+        or override_failure_rows
     )
+
+    if needs_attention:
+        forms.alert(
+            status_message,
+            sub_msg=summary,
+        )
 
 
 if __name__ == "__main__":
