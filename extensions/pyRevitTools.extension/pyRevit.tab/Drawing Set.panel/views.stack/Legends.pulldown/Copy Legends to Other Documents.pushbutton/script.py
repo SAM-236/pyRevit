@@ -903,9 +903,17 @@ def recreate_reference_planes(
     destination_doc,
     destination_view,
 ):
-    """Recreate reference planes and return their element pairs."""
+    """Recreate reference planes and return their element pairs.
+
+    Returns:
+        tuple: ``(pairs, failures, ungrouped)``. ``ungrouped`` lists planes
+        that belonged to a group in the source; they are recreated standalone
+        because the Revit API cannot add elements to an existing group, so the
+        user must regroup them manually. They are notices, not failures.
+    """
     reference_plane_pairs = []
     failures = []
+    ungrouped = []
     existing_names = get_reference_plane_names(destination_doc)
 
     for source_reference_plane in source_reference_planes:
@@ -933,11 +941,15 @@ def recreate_reference_planes(
             )
 
             if id_value(source_reference_plane.GroupId) != id_value(INVALID_ID):
-                failures.append(
+                source_group = source_reference_plane.Document.GetElement(
+                    source_reference_plane.GroupId
+                )
+                ungrouped.append(
                     (
                         source_reference_plane.Id,
-                        "Recreated outside its source group; the Revit API "
-                        "cannot add elements to an existing group.",
+                        destination_reference_plane.Id,
+                        destination_reference_plane.Name or "(unnamed)",
+                        source_group.Name if source_group else "",
                     )
                 )
         except Exception as error:
@@ -948,7 +960,7 @@ def recreate_reference_planes(
                 )
             )
 
-    return reference_plane_pairs, failures
+    return reference_plane_pairs, failures, ungrouped
 
 
 def has_view_specific_graphics(doc, view, element_id):
@@ -1603,6 +1615,7 @@ def main():
     result_rows = []
     override_failure_rows = []
     revit_warning_rows = []
+    ungrouped_reference_plane_rows = []
     uncategorized_rows = []
     skipped_element_rows = []
 
@@ -1929,6 +1942,7 @@ def main():
                         (
                             reference_plane_pairs,
                             reference_plane_failures,
+                            ungrouped_reference_planes,
                         ) = recreate_reference_planes(
                             source_reference_planes,
                             dest_doc,
@@ -1942,6 +1956,23 @@ def main():
                             )
 
                         element_pairs.extend(reference_plane_pairs)
+
+                        for (
+                            source_reference_plane_id,
+                            destination_reference_plane_id,
+                            reference_plane_name,
+                            source_group_name,
+                        ) in ungrouped_reference_planes:
+                            ungrouped_reference_plane_rows.append(
+                                [
+                                    dest_doc.Title,
+                                    legend_name,
+                                    reference_plane_name,
+                                    str(id_value(source_reference_plane_id)),
+                                    str(id_value(destination_reference_plane_id)),
+                                    source_group_name,
+                                ]
+                            )
 
                         for (
                             source_reference_plane_id,
@@ -2192,6 +2223,26 @@ def main():
                 "Failure",
             ],
             title="Graphic and Recreation Failures",
+        )
+
+    if ungrouped_reference_plane_rows:
+        output.print_md(
+            "**Note:** the Revit API cannot add elements to an existing "
+            "group, so reference planes that were grouped in the source are "
+            "recreated outside their group. Add them back to the group "
+            "manually if needed."
+        )
+        output.print_table(
+            table_data=ungrouped_reference_plane_rows,
+            columns=[
+                "Destination",
+                "Legend",
+                "Reference Plane",
+                "Source ID",
+                "Destination ID",
+                "Source Group",
+            ],
+            title="Reference Planes to Regroup Manually",
         )
 
     if revit_warning_rows:
