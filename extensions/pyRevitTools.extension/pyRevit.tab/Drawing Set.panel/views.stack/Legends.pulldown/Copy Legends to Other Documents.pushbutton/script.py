@@ -6,21 +6,24 @@ from collections import defaultdict
 import System
 from Autodesk.Revit.DB import Transaction, TransactionGroup
 from pyrevit import DB, forms, revit, script
+from pyrevit.compat import get_elementid_value_func
 from pyrevit.framework import List
 
 
 SOURCE_DOC = revit.doc
 INVALID_ID = DB.ElementId.InvalidElementId
+get_elementid_value = get_elementid_value_func()
 
 
 def id_value(element_id):
     if element_id is None:
         return -1
 
-    try:
-        return element_id.Value
-    except AttributeError:
-        return element_id.IntegerValue
+    return get_elementid_value(element_id)
+
+
+def escape_format_braces(text):
+    return text.replace("{", "{{").replace("}", "}}")
 
 
 def point_key(point, precision=7):
@@ -63,11 +66,7 @@ def element_signature(element, view):
     if element is None:
         return None
 
-    category_id = (
-        id_value(element.Category.Id)
-        if element.Category
-        else -1
-    )
+    category_id = id_value(element.Category.Id) if element.Category else -1
     class_name = element.GetType().FullName
     text_value = None
 
@@ -104,9 +103,7 @@ def element_signature(element, view):
     family_name = None
 
     try:
-        element_type = element.Document.GetElement(
-            element.GetTypeId()
-        )
+        element_type = element.Document.GetElement(element.GetTypeId())
 
         if element_type:
             type_name = element_type.Name
@@ -138,10 +135,17 @@ def match_copied_elements(
     destination_view,
     destination_ids,
 ):
-    """Match copied elements by geometry and content.
+    """Pair copied elements with their sources by geometry and content.
 
-    Positional matching is used only for unresolved elements when the remaining
-    source and destination collections have an unambiguous one-to-one mapping.
+    Returns:
+        tuple: ``(pairs, unmatched_source_ids)``.
+
+    Note:
+        Neither ``CopyElements`` nor ``GetMemberIds`` guarantees ordering, so
+        nothing is paired by position. A signature is paired only when both
+        sides hold the same number of elements; such elements are visually
+        indistinguishable, so any pairing between them is equivalent. All
+        other source elements are returned as unmatched instead of raising.
     """
     source_groups = defaultdict(list)
     destination_groups = defaultdict(list)
@@ -160,7 +164,6 @@ def match_copied_elements(
         destination_groups[signature].append(destination_id)
 
     pairs = []
-    used_destination_values = set()
     unmatched_source_ids = []
 
     for signature, grouped_source_ids in source_groups.items():
@@ -169,103 +172,17 @@ def match_copied_elements(
             [],
         )
 
-        if (
-            grouped_destination_ids
-            and len(grouped_source_ids)
-            == len(grouped_destination_ids)
-        ):
-            grouped_source_ids = sorted(
-                grouped_source_ids,
-                key=id_value,
-            )
-            grouped_destination_ids = sorted(
-                grouped_destination_ids,
-                key=id_value,
-            )
-
-            for source_id, destination_id in zip(
-                grouped_source_ids,
-                grouped_destination_ids,
-            ):
-                pairs.append((source_id, destination_id))
-                used_destination_values.add(
-                    id_value(destination_id)
+        if len(grouped_source_ids) == len(grouped_destination_ids):
+            pairs.extend(
+                zip(
+                    sorted(grouped_source_ids, key=id_value),
+                    sorted(grouped_destination_ids, key=id_value),
                 )
+            )
         else:
-            unmatched_source_ids.extend(
-                grouped_source_ids
-            )
+            unmatched_source_ids.extend(grouped_source_ids)
 
-    unmatched_destination_ids = [
-        destination_id
-        for destination_id in destination_ids
-        if id_value(destination_id)
-        not in used_destination_values
-    ]
-
-    if unmatched_source_ids:
-        source_positions = dict(
-            (id_value(source_id), index)
-            for index, source_id in enumerate(source_ids)
-        )
-        destination_positions = dict(
-            (index, destination_id)
-            for index, destination_id
-            in enumerate(destination_ids)
-        )
-        unmatched_destination_values = set(
-            id_value(destination_id)
-            for destination_id in unmatched_destination_ids
-        )
-        fallback_pairs = []
-
-        for source_id in unmatched_source_ids:
-            index = source_positions[id_value(source_id)]
-            destination_id = destination_positions.get(index)
-
-            if destination_id is None:
-                raise Exception(
-                    "Unable to safely match copied element {}."
-                    .format(id_value(source_id))
-                )
-
-            if (
-                id_value(destination_id)
-                not in unmatched_destination_values
-            ):
-                raise Exception(
-                    "Unable to safely match copied element {}."
-                    .format(id_value(source_id))
-                )
-
-            fallback_pairs.append(
-                (source_id, destination_id)
-            )
-
-        if (
-            len(fallback_pairs)
-            != len(unmatched_destination_ids)
-        ):
-            raise Exception(
-                "Source/destination element matching was ambiguous."
-            )
-
-        pairs.extend(fallback_pairs)
-
-    if (
-        len(pairs) != len(source_ids)
-        or len(pairs) != len(destination_ids)
-    ):
-        raise Exception(
-            "Matched {} source/destination elements, "
-            "but copied {} of {} source elements.".format(
-                len(pairs),
-                len(destination_ids),
-                len(source_ids),
-            )
-        )
-
-    return pairs
+    return pairs, unmatched_source_ids
 
 
 def rounded_number(value):
@@ -301,10 +218,7 @@ def fill_grid_signature(grid):
         origin = None
 
     try:
-        segments = tuple(
-            rounded_number(value)
-            for value in grid.GetSegments()
-        )
+        segments = tuple(rounded_number(value) for value in grid.GetSegments())
     except Exception:
         segments = tuple()
 
@@ -325,10 +239,7 @@ def fill_pattern_signature(pattern_element):
     pattern = pattern_element.GetFillPattern()
 
     try:
-        grids = sorted(
-            fill_grid_signature(grid)
-            for grid in pattern.GetFillGrids()
-        )
+        grids = sorted(fill_grid_signature(grid) for grid in pattern.GetFillGrids())
     except Exception:
         grids = []
 
@@ -382,9 +293,8 @@ def build_pattern_maps(destination_doc):
     line_names = set()
     fill_names = set()
 
-    line_patterns = (
-        DB.FilteredElementCollector(destination_doc)
-        .OfClass(DB.LinePatternElement)
+    line_patterns = DB.FilteredElementCollector(destination_doc).OfClass(
+        DB.LinePatternElement
     )
 
     for element in line_patterns:
@@ -393,9 +303,8 @@ def build_pattern_maps(destination_doc):
         line_by_name[element.Name].append(element.Id)
         line_names.add(element.Name)
 
-    fill_patterns = (
-        DB.FilteredElementCollector(destination_doc)
-        .OfClass(DB.FillPatternElement)
+    fill_patterns = DB.FilteredElementCollector(destination_doc).OfClass(
+        DB.FillPatternElement
     )
 
     for element in fill_patterns:
@@ -408,9 +317,7 @@ def build_pattern_maps(destination_doc):
             pattern = element.GetFillPattern()
 
             if pattern.IsSolidFill:
-                fill_solid_by_target[
-                    str(pattern.Target)
-                ].append(element.Id)
+                fill_solid_by_target[str(pattern.Target)].append(element.Id)
         except Exception:
             pass
 
@@ -434,18 +341,14 @@ def clone_line_pattern(
     source_pattern_element,
     pattern_maps,
 ):
-    source_pattern = (
-        source_pattern_element.GetLinePattern()
-    )
+    source_pattern = source_pattern_element.GetLinePattern()
     new_name = unique_pattern_name(
         source_pattern_element.Name,
         pattern_maps["line_names"],
         "pyRevit Imported",
     )
     cloned_pattern = DB.LinePattern(new_name)
-    cloned_pattern.SetSegments(
-        source_pattern.GetSegments()
-    )
+    cloned_pattern.SetSegments(source_pattern.GetSegments())
 
     created = DB.LinePatternElement.Create(
         pattern_maps["destination_doc"],
@@ -454,15 +357,9 @@ def clone_line_pattern(
     signature = line_pattern_signature(created)
 
     pattern_maps["line_names"].add(created.Name)
-    pattern_maps["line_by_name"][
-        created.Name
-    ].append(created.Id)
-    pattern_maps["line_by_signature"][
-        signature
-    ].append(created.Id)
-    pattern_maps["created_line_patterns"].append(
-        created.Name
-    )
+    pattern_maps["line_by_name"][created.Name].append(created.Id)
+    pattern_maps["line_by_signature"][signature].append(created.Id)
+    pattern_maps["created_line_patterns"].append(created.Name)
 
     return created.Id
 
@@ -495,9 +392,7 @@ def clone_fill_pattern(
     source_pattern_element,
     pattern_maps,
 ):
-    source_pattern = (
-        source_pattern_element.GetFillPattern()
-    )
+    source_pattern = source_pattern_element.GetFillPattern()
     new_name = unique_pattern_name(
         source_pattern_element.Name,
         pattern_maps["fill_names"],
@@ -511,9 +406,7 @@ def clone_fill_pattern(
     cloned_grids = List[DB.FillGrid]()
 
     for source_grid in source_pattern.GetFillGrids():
-        cloned_grids.Add(
-            clone_fill_grid(source_grid)
-        )
+        cloned_grids.Add(clone_fill_grid(source_grid))
 
     cloned_pattern.SetFillGrids(cloned_grids)
 
@@ -524,15 +417,9 @@ def clone_fill_pattern(
     signature = fill_pattern_signature(created)
 
     pattern_maps["fill_names"].add(created.Name)
-    pattern_maps["fill_by_name"][
-        created.Name
-    ].append(created.Id)
-    pattern_maps["fill_by_signature"][
-        signature
-    ].append(created.Id)
-    pattern_maps["created_fill_patterns"].append(
-        created.Name
-    )
+    pattern_maps["fill_by_name"][created.Name].append(created.Id)
+    pattern_maps["fill_by_signature"][signature].append(created.Id)
+    pattern_maps["created_fill_patterns"].append(created.Name)
 
     return created.Id
 
@@ -556,14 +443,9 @@ def resolve_line_pattern_id(
     source_pattern = source_doc.GetElement(source_id)
 
     if not source_pattern:
-        raise Exception(
-            "Source line pattern {} was not found."
-            .format(value)
-        )
+        raise Exception("Source line pattern {} was not found.".format(value))
 
-    exact_matches = pattern_maps[
-        "line_by_signature"
-    ].get(
+    exact_matches = pattern_maps["line_by_signature"].get(
         line_pattern_signature(source_pattern),
         [],
     )
@@ -597,34 +479,18 @@ def resolve_fill_pattern_id(
     if value in pattern_maps["fill_cache"]:
         return pattern_maps["fill_cache"][value]
 
-    source_pattern_element = source_doc.GetElement(
-        source_id
-    )
+    source_pattern_element = source_doc.GetElement(source_id)
 
     if not source_pattern_element:
-        raise Exception(
-            "Source fill pattern {} was not found."
-            .format(value)
-        )
+        raise Exception("Source fill pattern {} was not found.".format(value))
 
-    source_pattern = (
-        source_pattern_element.GetFillPattern()
-    )
-    signature = fill_pattern_signature(
-        source_pattern_element
-    )
-    exact_matches = pattern_maps[
-        "fill_by_signature"
-    ].get(signature, [])
+    source_pattern = source_pattern_element.GetFillPattern()
+    signature = fill_pattern_signature(source_pattern_element)
+    exact_matches = pattern_maps["fill_by_signature"].get(signature, [])
     destination_id = lowest_id(exact_matches)
 
-    if (
-        destination_id is None
-        and source_pattern.IsSolidFill
-    ):
-        solid_matches = pattern_maps[
-            "fill_solid_by_target"
-        ].get(
+    if destination_id is None and source_pattern.IsSolidFill:
+        solid_matches = pattern_maps["fill_solid_by_target"].get(
             str(source_pattern.Target),
             [],
         )
@@ -648,8 +514,14 @@ def expand_group_member_pairs(
     destination_view,
     element_pairs,
 ):
-    """Recursively match copied group members at every nesting depth."""
+    """Recursively match copied group members at every nesting depth.
+
+    Returns:
+        tuple: ``(expanded_pairs, unmatched_source_ids)``; members that cannot
+        be matched unambiguously are reported instead of aborting the legend.
+    """
     expanded_pairs = list(element_pairs)
+    unmatched_source_ids = []
     pending_pairs = list(element_pairs)
     processed_group_pairs = set()
     existing_pair_keys = set(
@@ -664,9 +536,7 @@ def expand_group_member_pairs(
         source_id, destination_id = pending_pairs.pop()
 
         source_element = source_doc.GetElement(source_id)
-        destination_element = destination_doc.GetElement(
-            destination_id
-        )
+        destination_element = destination_doc.GetElement(destination_id)
 
         if not isinstance(source_element, DB.Group):
             continue
@@ -684,7 +554,7 @@ def expand_group_member_pairs(
 
         processed_group_pairs.add(group_pair_key)
 
-        member_pairs = match_copied_elements(
+        member_pairs, unmatched_members = match_copied_elements(
             source_doc,
             source_view,
             list(source_element.GetMemberIds()),
@@ -692,6 +562,7 @@ def expand_group_member_pairs(
             destination_view,
             list(destination_element.GetMemberIds()),
         )
+        unmatched_source_ids.extend(unmatched_members)
 
         for (
             member_source_id,
@@ -711,16 +582,11 @@ def expand_group_member_pairs(
                     )
                 )
 
-            source_member = source_doc.GetElement(
-                member_source_id
-            )
-            destination_member = destination_doc.GetElement(
-                member_destination_id
-            )
+            source_member = source_doc.GetElement(member_source_id)
+            destination_member = destination_doc.GetElement(member_destination_id)
 
-            if (
-                isinstance(source_member, DB.Group)
-                and isinstance(destination_member, DB.Group)
+            if isinstance(source_member, DB.Group) and isinstance(
+                destination_member, DB.Group
             ):
                 pending_pairs.append(
                     (
@@ -729,7 +595,7 @@ def expand_group_member_pairs(
                     )
                 )
 
-    return expanded_pairs
+    return expanded_pairs, unmatched_source_ids
 
 
 def reference_plane_third_point(reference_plane):
@@ -739,21 +605,14 @@ def reference_plane_third_point(reference_plane):
     line_direction = free_end - bubble_end
 
     if line_direction.GetLength() <= 1e-9:
-        raise Exception(
-            "The source reference plane has coincident endpoints."
-        )
+        raise Exception("The source reference plane has coincident endpoints.")
 
     try:
         plane = reference_plane.GetPlane()
-        perpendicular = plane.Normal.CrossProduct(
-            line_direction
-        )
+        perpendicular = plane.Normal.CrossProduct(line_direction)
 
         if perpendicular.GetLength() > 1e-9:
-            return (
-                bubble_end
-                + perpendicular.Normalize()
-            )
+            return bubble_end + perpendicular.Normalize()
     except Exception:
         pass
 
@@ -764,27 +623,19 @@ def reference_plane_third_point(reference_plane):
     )
 
     for fallback_vector in fallback_vectors:
-        perpendicular = fallback_vector.CrossProduct(
-            line_direction
-        )
+        perpendicular = fallback_vector.CrossProduct(line_direction)
 
         if perpendicular.GetLength() > 1e-9:
-            return (
-                bubble_end
-                + perpendicular.Normalize()
-            )
+            return bubble_end + perpendicular.Normalize()
 
-    raise Exception(
-        "Unable to determine the reference plane orientation."
-    )
+    raise Exception("Unable to determine the reference plane orientation.")
 
 
 def get_reference_plane_names(destination_doc):
     names = set()
 
-    reference_planes = (
-        DB.FilteredElementCollector(destination_doc)
-        .OfClass(DB.ReferencePlane)
+    reference_planes = DB.FilteredElementCollector(destination_doc).OfClass(
+        DB.ReferencePlane
     )
 
     for reference_plane in reference_planes:
@@ -834,26 +685,29 @@ def recreate_reference_plane(
     destination_view,
     existing_names,
 ):
-    """Recreate a reference plane directly in a destination legend."""
+    """Recreate a reference plane directly in a destination legend.
+
+    Returns:
+        tuple: ``(reference_plane, rename_error)``; ``rename_error`` is
+        ``None`` unless the source name could not be applied.
+    """
     bubble_end = source_reference_plane.BubbleEnd
     free_end = source_reference_plane.FreeEnd
-    third_point = reference_plane_third_point(
-        source_reference_plane
-    )
+    third_point = reference_plane_third_point(source_reference_plane)
 
-    destination_reference_plane = (
-        destination_doc.Create.NewReferencePlane2(
-            bubble_end,
-            free_end,
-            third_point,
-            destination_view,
-        )
+    destination_reference_plane = destination_doc.Create.NewReferencePlane2(
+        bubble_end,
+        free_end,
+        third_point,
+        destination_view,
     )
 
     try:
         source_name = source_reference_plane.Name
     except Exception:
         source_name = None
+
+    rename_error = None
 
     if source_name:
         destination_name = unique_reference_plane_name(
@@ -862,13 +716,14 @@ def recreate_reference_plane(
         )
 
         try:
-            destination_reference_plane.Name = (
-                destination_name
+            destination_reference_plane.Name = destination_name
+        except Exception as error:
+            rename_error = "Could not rename to '{}': {}".format(
+                destination_name,
+                error,
             )
-        except Exception:
-            pass
 
-    return destination_reference_plane
+    return destination_reference_plane, rename_error
 
 
 def recreate_reference_planes(
@@ -879,20 +734,24 @@ def recreate_reference_planes(
     """Recreate reference planes and return their element pairs."""
     reference_plane_pairs = []
     failures = []
-    existing_names = get_reference_plane_names(
-        destination_doc
-    )
+    existing_names = get_reference_plane_names(destination_doc)
 
     for source_reference_plane in source_reference_planes:
         try:
-            destination_reference_plane = (
-                recreate_reference_plane(
-                    source_reference_plane,
-                    destination_doc,
-                    destination_view,
-                    existing_names,
-                )
+            destination_reference_plane, rename_error = recreate_reference_plane(
+                source_reference_plane,
+                destination_doc,
+                destination_view,
+                existing_names,
             )
+
+            if rename_error:
+                failures.append(
+                    (
+                        source_reference_plane.Id,
+                        rename_error,
+                    )
+                )
 
             reference_plane_pairs.append(
                 (
@@ -923,9 +782,7 @@ def record_override_failure(
     property_name,
     error,
 ):
-    failures.append(
-        "{}: {}".format(property_name, error)
-    )
+    failures.append("{}: {}".format(property_name, error))
 
 
 def copy_color_property(
@@ -1032,16 +889,11 @@ def copy_line_pattern_property(
             property_name,
         )
 
-        if (
-            id_value(source_pattern_id)
-            != id_value(INVALID_ID)
-        ):
-            destination_pattern_id = (
-                resolve_line_pattern_id(
-                    source_doc,
-                    source_pattern_id,
-                    pattern_maps,
-                )
+        if id_value(source_pattern_id) != id_value(INVALID_ID):
+            destination_pattern_id = resolve_line_pattern_id(
+                source_doc,
+                source_pattern_id,
+                pattern_maps,
             )
             setter = getattr(
                 destination_ogs,
@@ -1072,16 +924,11 @@ def copy_fill_pattern_property(
             property_name,
         )
 
-        if (
-            id_value(source_pattern_id)
-            != id_value(INVALID_ID)
-        ):
-            destination_pattern_id = (
-                resolve_fill_pattern_id(
-                    source_doc,
-                    source_pattern_id,
-                    pattern_maps,
-                )
+        if id_value(source_pattern_id) != id_value(INVALID_ID):
+            destination_pattern_id = resolve_fill_pattern_id(
+                source_doc,
+                source_pattern_id,
+                pattern_maps,
             )
             setter = getattr(
                 destination_ogs,
@@ -1108,12 +955,11 @@ def apply_destination_overrides(
     """Transfer supported element overrides and hidden state.
 
     Graphic properties are reported as applied only after the destination view
-    accepts the completed OverrideGraphicSettings object.
+    accepts the completed OverrideGraphicSettings object. Hidden state is
+    transferred even when the graphic override write fails.
     """
     source_ogs = source_view.GetElementOverrides(source_id)
-    destination_ogs = destination_view.GetElementOverrides(
-        destination_id
-    )
+    destination_ogs = destination_view.GetElementOverrides(destination_id)
     prepared = []
     failures = []
 
@@ -1204,9 +1050,7 @@ def apply_destination_overrides(
         )
 
     try:
-        destination_ogs.SetSurfaceTransparency(
-            source_ogs.Transparency
-        )
+        destination_ogs.SetSurfaceTransparency(source_ogs.Transparency)
         prepared.append("Transparency")
     except Exception as error:
         record_override_failure(
@@ -1225,13 +1069,8 @@ def apply_destination_overrides(
     )
 
     try:
-        if (
-            source_ogs.DetailLevel
-            != DB.ViewDetailLevel.Undefined
-        ):
-            destination_ogs.SetDetailLevel(
-                source_ogs.DetailLevel
-            )
+        if source_ogs.DetailLevel != DB.ViewDetailLevel.Undefined:
+            destination_ogs.SetDetailLevel(source_ogs.DetailLevel)
             prepared.append("DetailLevel")
     except Exception as error:
         record_override_failure(
@@ -1240,28 +1079,25 @@ def apply_destination_overrides(
             error,
         )
 
+    applied = []
+
     try:
         destination_view.SetElementOverrides(
             destination_id,
             destination_ogs,
         )
+        applied.extend(prepared)
     except Exception as error:
         record_override_failure(
             failures,
             "SetElementOverrides",
             error,
         )
-        return [], failures
-
-    applied = list(prepared)
 
     try:
         source_element = source_doc.GetElement(source_id)
 
-        if (
-            source_element
-            and source_element.IsHidden(source_view)
-        ):
+        if source_element and source_element.IsHidden(source_view):
             hidden_ids = List[DB.ElementId]()
             hidden_ids.Add(destination_id)
             destination_view.HideElements(hidden_ids)
@@ -1278,19 +1114,14 @@ def apply_destination_overrides(
     return applied, failures
 
 
-class CopyUseDestination(
-    DB.IDuplicateTypeNamesHandler
-):
-
+class CopyUseDestination(DB.IDuplicateTypeNamesHandler):
     def OnDuplicateTypeNamesFound(self, args):
         return DB.DuplicateTypeAction.UseDestinationTypes
 
 
 def can_duplicate_legend(view):
     try:
-        return view.CanViewBeDuplicated(
-            DB.ViewDuplicateOption.Duplicate
-        )
+        return view.CanViewBeDuplicated(DB.ViewDuplicateOption.Duplicate)
     except Exception:
         return False
 
@@ -1330,34 +1161,24 @@ def main():
     logger = script.get_logger()
     output = script.get_output()
 
-    open_docs = forms.select_open_docs(
-        title="Select Destination Documents"
-    )
+    open_docs = forms.select_open_docs(title="Select Destination Documents")
 
     if not open_docs:
         script.exit()
 
     legends = forms.select_views(
         title="Select Legend Views",
-        filterfunc=lambda view: (
-            view.ViewType == DB.ViewType.Legend
-        ),
+        filterfunc=lambda view: view.ViewType == DB.ViewType.Legend,
         use_selection=True,
     )
 
     if not legends:
-        forms.alert(
-            "No legend views were selected."
-        )
+        forms.alert("No legend views were selected.")
         script.exit()
 
     output.close_others()
-    output.set_title(
-        "Copy Legends to Other Documents"
-    )
-    output.print_md(
-        "# Copy Legends to Other Documents"
-    )
+    output.set_title("Copy Legends to Other Documents")
+    output.print_md("# Copy Legends to Other Documents")
 
     total_operations = len(legends) * len(open_docs)
 
@@ -1387,37 +1208,26 @@ def main():
         cancellable=True,
         step=1,
     ) as progress:
-
         for dest_doc in open_docs:
             if cancelled:
                 break
 
-            all_graphviews = revit.query.get_all_views(
-                doc=dest_doc
-            )
+            all_graphviews = revit.query.get_all_views(doc=dest_doc)
             all_legend_names = [
                 revit.query.get_name(view)
                 for view in all_graphviews
                 if view.ViewType == DB.ViewType.Legend
             ]
-            base_legend = revit.query.find_first_legend(
-                doc=dest_doc
-            )
+            base_legend = revit.query.find_first_legend(doc=dest_doc)
 
-            if (
-                not base_legend
-                or not can_duplicate_legend(base_legend)
-            ):
+            if not base_legend or not can_duplicate_legend(base_legend):
                 if base_legend:
                     reason = (
                         "No legend capable of duplication "
                         "exists in the destination document."
                     )
                 else:
-                    reason = (
-                        "No base legend exists in the "
-                        "destination document."
-                    )
+                    reason = "No base legend exists in the destination document."
 
                 logger.warning(
                     "Skipping destination document '%s': %s",
@@ -1426,9 +1236,7 @@ def main():
                 )
 
                 for src_legend in legends:
-                    legend_name = revit.query.get_name(
-                        src_legend
-                    )
+                    legend_name = revit.query.get_name(src_legend)
 
                     add_result_row(
                         result_rows,
@@ -1463,18 +1271,14 @@ def main():
                         cancelled = True
                         break
 
-                    legend_name = revit.query.get_name(
-                        src_legend
-                    )
+                    legend_name = revit.query.get_name(src_legend)
                     operation_number = current_operation + 1
 
-                    progress.title = (
-                        "{} of {} | {} | {}".format(
-                            operation_number,
-                            total_operations,
-                            dest_doc.Title,
-                            legend_name,
-                        )
+                    progress.title = "{} of {} | {} | {}".format(
+                        operation_number,
+                        total_operations,
+                        escape_format_braces(dest_doc.Title),
+                        escape_format_braces(legend_name),
                     )
                     progress.update_progress(
                         operation_number,
@@ -1488,10 +1292,8 @@ def main():
                     )
 
                     view_elements = (
-                        DB.FilteredElementCollector(
-                            SOURCE_DOC,
-                            src_legend.Id,
-                        )
+                        DB.FilteredElementCollector(SOURCE_DOC)
+                        .OwnedByView(src_legend.Id)
                         .WhereElementIsNotElementType()
                         .ToElements()
                     )
@@ -1499,10 +1301,7 @@ def main():
                     candidate_ids = set(
                         id_value(element.Id)
                         for element in view_elements
-                        if (
-                            element
-                            and element.Category is not None
-                        )
+                        if (element and element.Category is not None)
                     )
 
                     source_ids = []
@@ -1514,24 +1313,30 @@ def main():
                             continue
 
                         if element.Category is None:
+                            skipped_element_rows.append(
+                                [
+                                    dest_doc.Title,
+                                    legend_name,
+                                    str(id_value(element.Id)),
+                                    "{} has no category and is not copied.".format(
+                                        source_element_label(element)
+                                    ),
+                                ]
+                            )
                             continue
 
                         if isinstance(
                             element,
                             DB.ReferencePlane,
                         ):
-                            source_reference_planes.append(
-                                element
-                            )
+                            source_reference_planes.append(element)
                             continue
 
                         group_id = element.GroupId
 
                         is_group_member = (
-                            id_value(group_id)
-                            != id_value(INVALID_ID)
-                            and id_value(group_id)
-                            in candidate_ids
+                            id_value(group_id) != id_value(INVALID_ID)
+                            and id_value(group_id) in candidate_ids
                         )
 
                         if is_group_member:
@@ -1549,13 +1354,9 @@ def main():
                             grouped_member_count,
                         )
 
-                    if (
-                        not source_ids
-                        and not source_reference_planes
-                    ):
+                    if not source_ids and not source_reference_planes:
                         reason = (
-                            "The source legend contains no "
-                            "supported elements to copy."
+                            "The source legend contains no supported elements to copy."
                         )
 
                         logger.warning(
@@ -1597,87 +1398,78 @@ def main():
                     failed_override_count = 0
 
                     try:
-                        destination_view_id = (
-                            base_legend.Duplicate(
-                                DB.ViewDuplicateOption.Duplicate
-                            )
+                        destination_view_id = base_legend.Duplicate(
+                            DB.ViewDuplicateOption.Duplicate
                         )
-                        dest_view = dest_doc.GetElement(
-                            destination_view_id
-                        )
+                        dest_view = dest_doc.GetElement(destination_view_id)
 
                         options = DB.CopyPasteOptions()
-                        options.SetDuplicateTypeNamesHandler(
-                            CopyUseDestination()
-                        )
+                        options.SetDuplicateTypeNamesHandler(CopyUseDestination())
 
-                        ordered_source_ids = (
-                            List[DB.ElementId]()
-                        )
+                        ordered_source_ids = List[DB.ElementId]()
 
                         for source_id in source_ids:
                             ordered_source_ids.Add(source_id)
 
-                        source_ids = [
-                            element_id
-                            for element_id in ordered_source_ids
-                        ]
+                        source_ids = [element_id for element_id in ordered_source_ids]
 
                         if source_ids:
-                            copied_collection = (
-                                DB.ElementTransformUtils.CopyElements(
-                                    src_legend,
-                                    ordered_source_ids,
-                                    dest_view,
-                                    None,
-                                    options,
-                                )
+                            copied_collection = DB.ElementTransformUtils.CopyElements(
+                                src_legend,
+                                ordered_source_ids,
+                                dest_view,
+                                None,
+                                options,
                             )
 
                             copied_ids = [
-                                element_id
-                                for element_id
-                                in copied_collection
+                                element_id for element_id in copied_collection
                             ]
 
-                            if (
-                                len(source_ids)
-                                != len(copied_ids)
-                            ):
-                                raise Exception(
-                                    "CopyElements returned {} "
-                                    "destination IDs for {} "
-                                    "source IDs.".format(
-                                        len(copied_ids),
-                                        len(source_ids),
-                                    )
-                                )
-
-                        pattern_maps = build_pattern_maps(
-                            dest_doc
-                        )
+                        pattern_maps = build_pattern_maps(dest_doc)
                         element_pairs = []
+                        unmatched_source_ids = []
 
                         if source_ids:
-                            element_pairs = (
-                                match_copied_elements(
-                                    SOURCE_DOC,
-                                    src_legend,
-                                    source_ids,
-                                    dest_doc,
-                                    dest_view,
-                                    copied_ids,
-                                )
+                            (
+                                element_pairs,
+                                unmatched_source_ids,
+                            ) = match_copied_elements(
+                                SOURCE_DOC,
+                                src_legend,
+                                source_ids,
+                                dest_doc,
+                                dest_view,
+                                copied_ids,
                             )
 
-                            element_pairs = (
-                                expand_group_member_pairs(
-                                    SOURCE_DOC,
-                                    src_legend,
-                                    dest_doc,
-                                    dest_view,
-                                    element_pairs,
-                                )
+                            (
+                                element_pairs,
+                                unmatched_members,
+                            ) = expand_group_member_pairs(
+                                SOURCE_DOC,
+                                src_legend,
+                                dest_doc,
+                                dest_view,
+                                element_pairs,
+                            )
+                            unmatched_source_ids.extend(unmatched_members)
+
+                        for unmatched_source_id in unmatched_source_ids:
+                            failed_override_count += 1
+                            override_failure_rows.append(
+                                [
+                                    dest_doc.Title,
+                                    legend_name,
+                                    str(id_value(unmatched_source_id)),
+                                    "",
+                                    source_element_label(
+                                        SOURCE_DOC.GetElement(unmatched_source_id)
+                                    ),
+                                    "Copied, but could not be matched "
+                                    "unambiguously; overrides were not "
+                                    "transferred.",
+                                ]
                             )
 
                         (
@@ -1689,9 +1481,13 @@ def main():
                             dest_view,
                         )
 
-                        element_pairs.extend(
-                            reference_plane_pairs
-                        )
+                        if not copied_ids and not reference_plane_pairs:
+                            raise Exception(
+                                "No elements were copied or "
+                                "recreated in the destination legend."
+                            )
+
+                        element_pairs.extend(reference_plane_pairs)
 
                         for (
                             source_reference_plane_id,
@@ -1703,16 +1499,11 @@ def main():
                                 [
                                     dest_doc.Title,
                                     legend_name,
-                                    str(
-                                        id_value(
-                                            source_reference_plane_id
-                                        )
-                                    ),
+                                    str(id_value(source_reference_plane_id)),
                                     "",
                                     "ReferencePlane",
                                     (
-                                        "Reference plane recreation: {}"
-                                        .format(
+                                        "Reference plane recreation: {}".format(
                                             reference_plane_error
                                         )
                                     ),
@@ -1723,9 +1514,7 @@ def main():
                                 "Reference plane %s could not "
                                 "be recreated for legend '%s' "
                                 "in '%s': %s",
-                                id_value(
-                                    source_reference_plane_id
-                                ),
+                                id_value(source_reference_plane_id),
                                 legend_name,
                                 dest_doc.Title,
                                 reference_plane_error,
@@ -1753,30 +1542,16 @@ def main():
 
                                 if property_failures:
                                     failed_override_count += 1
-                                    source_element = (
-                                        SOURCE_DOC.GetElement(
-                                            source_id
-                                        )
-                                    )
+                                    source_element = SOURCE_DOC.GetElement(source_id)
 
                                     for property_failure in property_failures:
                                         override_failure_rows.append(
                                             [
                                                 dest_doc.Title,
                                                 legend_name,
-                                                str(
-                                                    id_value(
-                                                        source_id
-                                                    )
-                                                ),
-                                                str(
-                                                    id_value(
-                                                        destination_id
-                                                    )
-                                                ),
-                                                source_element_label(
-                                                    source_element
-                                                ),
+                                                str(id_value(source_id)),
+                                                str(id_value(destination_id)),
+                                                source_element_label(source_element),
                                                 property_failure,
                                             ]
                                         )
@@ -1789,34 +1564,22 @@ def main():
                                             "in '%s': %s",
                                             legend_name,
                                             id_value(source_id),
-                                            id_value(
-                                                destination_id
-                                            ),
+                                            id_value(destination_id),
                                             dest_doc.Title,
                                             property_failure,
                                         )
 
                             except Exception as override_error:
                                 failed_override_count += 1
-                                source_element = (
-                                    SOURCE_DOC.GetElement(
-                                        source_id
-                                    )
-                                )
+                                source_element = SOURCE_DOC.GetElement(source_id)
 
                                 override_failure_rows.append(
                                     [
                                         dest_doc.Title,
                                         legend_name,
                                         str(id_value(source_id)),
-                                        str(
-                                            id_value(
-                                                destination_id
-                                            )
-                                        ),
-                                        source_element_label(
-                                            source_element
-                                        ),
+                                        str(id_value(destination_id)),
+                                        source_element_label(source_element),
                                         str(override_error),
                                     ]
                                 )
@@ -1838,12 +1601,7 @@ def main():
 
                         while new_name in all_legend_names:
                             counter += 1
-                            new_name = (
-                                legend_name
-                                + " (Duplicate {})".format(
-                                    counter
-                                )
-                            )
+                            new_name = legend_name + " (Duplicate {})".format(counter)
 
                         revit.update.set_name(
                             dest_view,
@@ -1852,24 +1610,27 @@ def main():
                         dest_view.Scale = src_legend.Scale
                         all_legend_names.append(new_name)
 
-                        transaction.Commit()
+                        commit_status = transaction.Commit()
+
+                        if commit_status != DB.TransactionStatus.Committed:
+                            raise Exception(
+                                "The destination transaction did not "
+                                "commit (status: {}).".format(commit_status)
+                            )
+
                         destination_had_commit = True
 
                         if failed_override_count:
                             warning_count += 1
-                            result_label = (
-                                "Copied with warnings"
-                            )
+                            result_label = "Copied with warnings"
                             message = (
                                 "Created as '{}'. Some elements, "
                                 "reference planes, or overrides "
-                                "could not be transferred."
-                                .format(new_name)
+                                "could not be transferred.".format(new_name)
                             )
 
                             logger.warning(
-                                "Legend '%s' copied to '%s' "
-                                "with %s failure(s).",
+                                "Legend '%s' copied to '%s' with %s failure(s).",
                                 legend_name,
                                 dest_doc.Title,
                                 failed_override_count,
@@ -1877,14 +1638,10 @@ def main():
                         else:
                             succeeded_count += 1
                             result_label = "Copied"
-                            message = (
-                                "Created as '{}'."
-                                .format(new_name)
-                            )
+                            message = "Created as '{}'.".format(new_name)
 
                             logger.info(
-                                "Legend '%s' copied successfully "
-                                "to '%s' as '%s'.",
+                                "Legend '%s' copied successfully to '%s' as '%s'.",
                                 legend_name,
                                 dest_doc.Title,
                                 new_name,
@@ -1895,10 +1652,7 @@ def main():
                             dest_doc.Title,
                             legend_name,
                             result_label,
-                            (
-                                len(copied_ids)
-                                + len(reference_plane_pairs)
-                            ),
+                            (len(copied_ids) + len(reference_plane_pairs)),
                             "{} applied / {} failed".format(
                                 transferred_count,
                                 failed_override_count,
@@ -1907,10 +1661,7 @@ def main():
                         )
 
                     except Exception as legend_error:
-                        if (
-                            transaction.GetStatus()
-                            == DB.TransactionStatus.Started
-                        ):
+                        if transaction.GetStatus() == DB.TransactionStatus.Started:
                             transaction.RollBack()
 
                         failed_count += 1
@@ -1926,8 +1677,7 @@ def main():
                         )
 
                         logger.exception(
-                            "Legend '%s' could not be copied "
-                            "to '%s'.",
+                            "Legend '%s' could not be copied to '%s'.",
                             legend_name,
                             dest_doc.Title,
                         )
@@ -1947,15 +1697,11 @@ def main():
                     transaction_group.Assimilate()
 
             except Exception:
-                if (
-                    transaction_group.GetStatus()
-                    == DB.TransactionStatus.Started
-                ):
+                if transaction_group.GetStatus() == DB.TransactionStatus.Started:
                     transaction_group.RollBack()
 
                 logger.exception(
-                    "Unexpected destination-level "
-                    "failure in '%s'.",
+                    "Unexpected destination-level failure in '%s'.",
                     dest_doc.Title,
                 )
                 raise
@@ -1999,18 +1745,12 @@ def main():
             title="Elements Intentionally Skipped",
         )
 
-    completed_count = (
-        succeeded_count + warning_count
-    )
+    completed_count = succeeded_count + warning_count
 
     if cancelled:
-        status_message = (
-            "Copy operation cancelled."
-        )
+        status_message = "Copy operation cancelled."
     else:
-        status_message = (
-            "Legend copy operation complete."
-        )
+        status_message = "Legend copy operation complete."
 
     summary = (
         "Completed: {}\n"
