@@ -1407,11 +1407,12 @@ def internal_element_label(element):
 SKIPPED_BUILT_IN_CATEGORY_NAMES = ("OST_ViewportLabel",)
 
 
-def skipped_category_label(element):
-    """Return a label when the element's category is excluded from copying.
+def is_skipped_category(element):
+    """Tell whether the element's category is silently excluded from copying.
 
     View titles are excluded: a legend has no viewport, so a copied title
-    family only drags renamed View Title families into the destination.
+    family only drags renamed View Title families into the destination. Like
+    view-internal elements, they are not reported.
     """
     category_value = id_value(element.Category.Id)
 
@@ -1419,9 +1420,9 @@ def skipped_category_label(element):
         built_in = getattr(DB.BuiltInCategory, name, None)
 
         if built_in is not None and category_value == int(built_in):
-            return element.Category.Name
+            return True
 
-    return None
+    return False
 
 
 def describe_uncategorized_element(element):
@@ -1696,10 +1697,7 @@ def main():
                                 )
                             continue
 
-                        category_label = skipped_category_label(element)
-
-                        if category_label:
-                            skipped_labels[category_label] += 1
+                        if is_skipped_category(element):
                             continue
 
                         if isinstance(
