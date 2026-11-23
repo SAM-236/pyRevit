@@ -1399,6 +1399,51 @@ def internal_element_label(element):
     return source_element_label(element)
 
 
+SKIPPED_BUILT_IN_CATEGORY_NAMES = ("OST_ViewportLabel",)
+
+
+def skipped_category_label(element):
+    """Return a label when the element's category is excluded from copying.
+
+    View titles are excluded: a legend has no viewport, so a copied title
+    family only drags renamed View Title families into the destination.
+    """
+    category_value = id_value(element.Category.Id)
+
+    for name in SKIPPED_BUILT_IN_CATEGORY_NAMES:
+        built_in = getattr(DB.BuiltInCategory, name, None)
+
+        if built_in is not None and category_value == int(built_in):
+            return element.Category.Name
+
+    return None
+
+
+def describe_uncategorized_element(element):
+    group_value = id_value(element.GroupId)
+    parameter_names = sorted(
+        set(
+            parameter.Definition.Name
+            for parameter in element.Parameters
+            if parameter.Definition is not None
+        )
+    )
+
+    try:
+        has_geometry = element.get_Geometry(DB.Options()) is not None
+    except Exception:
+        has_geometry = False
+
+    return [
+        str(id_value(element.Id)),
+        element.GetType().FullName,
+        internal_element_label(element),
+        str(group_value) if group_value != id_value(INVALID_ID) else "",
+        "yes" if has_geometry else "no",
+        ", ".join(parameter_names[:8]) or "(none)",
+    ]
+
+
 class CopyUseDestination(DB.IDuplicateTypeNamesHandler):
     def OnDuplicateTypeNamesFound(self, args):
         return DB.DuplicateTypeAction.UseDestinationTypes
@@ -1509,6 +1554,7 @@ def main():
     result_rows = []
     override_failure_rows = []
     revit_warning_rows = []
+    uncategorized_rows = []
     skipped_element_rows = []
 
     current_operation = 0
@@ -1631,6 +1677,16 @@ def main():
                         if element.Category is None:
                             if not is_view_internal_element(element):
                                 skipped_labels[internal_element_label(element)] += 1
+                                uncategorized_rows.append(
+                                    [dest_doc.Title, legend_name]
+                                    + describe_uncategorized_element(element)
+                                )
+                            continue
+
+                        category_label = skipped_category_label(element)
+
+                        if category_label:
+                            skipped_labels[category_label] += 1
                             continue
 
                         if isinstance(
@@ -1659,7 +1715,7 @@ def main():
                                 dest_doc.Title,
                                 legend_name,
                                 str(sum(skipped_labels.values())),
-                                "No category, not copied: {}".format(
+                                "Not copied: {}".format(
                                     ", ".join(
                                         "{} x{}".format(label, count)
                                         for label, count in sorted(
@@ -2106,6 +2162,22 @@ def main():
                 "Reason",
             ],
             title="Elements Intentionally Skipped",
+        )
+
+    if uncategorized_rows:
+        output.print_table(
+            table_data=uncategorized_rows,
+            columns=[
+                "Destination",
+                "Legend",
+                "Element ID",
+                "Class",
+                "Name",
+                "Group ID",
+                "Geometry",
+                "Parameters",
+            ],
+            title="Uncategorized Elements (diagnostic)",
         )
 
     completed_count = succeeded_count + warning_count
