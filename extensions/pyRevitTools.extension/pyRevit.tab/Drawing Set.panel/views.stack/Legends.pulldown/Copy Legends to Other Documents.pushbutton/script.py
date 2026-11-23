@@ -1380,6 +1380,11 @@ def is_view_internal_element(element):
 
     Every view owns an ``ExtentElem`` and a ``SketchPlane``; skipping them is
     expected and is not reported to the user.
+
+    Note:
+        Category-less elements that are not visible in the source legend
+        (internal companions of detail content and group members) are skipped
+        silently by the caller as well; only visible ones are reported.
     """
     if isinstance(element, DB.SketchPlane):
         return True
@@ -1664,6 +1669,12 @@ def main():
                         for element in view_elements
                         if (element and element.Category is not None)
                     )
+                    visible_ids = set(
+                        id_value(element_id)
+                        for element_id in DB.FilteredElementCollector(
+                            SOURCE_DOC, src_legend.Id
+                        ).ToElementIds()
+                    )
 
                     skipped_labels = defaultdict(int)
                     source_ids = []
@@ -1675,7 +1686,9 @@ def main():
                             continue
 
                         if element.Category is None:
-                            if not is_view_internal_element(element):
+                            if id_value(
+                                element.Id
+                            ) in visible_ids and not is_view_internal_element(element):
                                 skipped_labels[internal_element_label(element)] += 1
                                 uncategorized_rows.append(
                                     [dest_doc.Title, legend_name]
@@ -2177,7 +2190,7 @@ def main():
                 "Geometry",
                 "Parameters",
             ],
-            title="Uncategorized Elements (diagnostic)",
+            title="Visible Uncategorized Elements Skipped",
         )
 
     completed_count = succeeded_count + warning_count
