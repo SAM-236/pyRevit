@@ -135,6 +135,18 @@ def relaxed_signature(signature):
     return class_name, category_id, curve, location, bbox
 
 
+def placement_signature(signature):
+    if signature is None:
+        return None
+
+    class_name, category_id, _, _, _, curve, location, _ = signature
+
+    if curve is None and location is None:
+        return None
+
+    return class_name, category_id, curve, location
+
+
 def pair_equal_signature_groups(source_signatures, destination_signatures):
     source_groups = defaultdict(list)
     destination_groups = defaultdict(list)
@@ -190,9 +202,15 @@ def match_copied_elements(
 ):
     """Pair copied elements with their sources by geometry and content.
 
-    Matching runs in two passes: first on the full signature, then, for the
-    leftovers only, on a relaxed signature that ignores type, family and text
-    names (``CopyElements`` may rename duplicate group or element types).
+    Matching runs in three passes, each over the previous pass's leftovers:
+    the full signature; a relaxed one that ignores type, family and text names
+    (``CopyElements`` may rename duplicate group or element types); and a
+    placement-only one (location point or curve) for elements whose bounding
+    box differs because the destination resolved to a different type.
+
+    Important:
+        The destination view must already have the source scale and the
+        document must be regenerated, or annotation bounding boxes differ.
 
     Returns:
         tuple: ``(pairs, unmatched_source_ids)``.
@@ -226,17 +244,34 @@ def match_copied_elements(
         source_signatures, destination_signatures
     )
 
-    relaxed_pairs, remaining_sources, _ = pair_equal_signature_groups(
-        [
-            (element_id, relaxed_signature(signature))
-            for element_id, signature in remaining_sources
-        ],
-        [
-            (element_id, relaxed_signature(signature))
-            for element_id, signature in remaining_destinations
-        ],
+    source_by_value = dict(
+        (id_value(element_id), signature) for element_id, signature in source_signatures
     )
-    pairs.extend(relaxed_pairs)
+    destination_by_value = dict(
+        (id_value(element_id), signature)
+        for element_id, signature in destination_signatures
+    )
+
+    for reduce_signature in (relaxed_signature, placement_signature):
+        fallback_pairs, remaining_sources, remaining_destinations = (
+            pair_equal_signature_groups(
+                [
+                    (
+                        element_id,
+                        reduce_signature(source_by_value[id_value(element_id)]),
+                    )
+                    for element_id, _ in remaining_sources
+                ],
+                [
+                    (
+                        element_id,
+                        reduce_signature(destination_by_value[id_value(element_id)]),
+                    )
+                    for element_id, _ in remaining_destinations
+                ],
+            )
+        )
+        pairs.extend(fallback_pairs)
 
     return pairs, [element_id for element_id, _ in remaining_sources]
 
@@ -836,6 +871,69 @@ def recreate_reference_planes(
             )
 
     return reference_plane_pairs, failures
+
+
+def has_view_specific_graphics(doc, view, element_id):
+    """Tell whether an element carries overrides or hidden state in a view.
+
+    Groups count when any nested member does, since their members are only
+    reachable through a matched group.
+    """
+    element = doc.GetElement(element_id)
+
+    if element is None:
+        return False
+
+    try:
+        if element.IsHidden(view):
+            return True
+    except Exception:
+        pass
+
+    try:
+        ogs = view.GetElementOverrides(element_id)
+        has_override = (
+            any(
+                valid_color(getattr(ogs, name))
+                for name in (
+                    "ProjectionLineColor",
+                    "CutLineColor",
+                    "SurfaceForegroundPatternColor",
+                    "SurfaceBackgroundPatternColor",
+                    "CutForegroundPatternColor",
+                    "CutBackgroundPatternColor",
+                )
+            )
+            or ogs.ProjectionLineWeight != -1
+            or ogs.CutLineWeight != -1
+            or any(
+                id_value(getattr(ogs, name)) != id_value(INVALID_ID)
+                for name in (
+                    "ProjectionLinePatternId",
+                    "CutLinePatternId",
+                    "SurfaceForegroundPatternId",
+                    "SurfaceBackgroundPatternId",
+                    "CutForegroundPatternId",
+                    "CutBackgroundPatternId",
+                )
+            )
+            or ogs.Halftone
+            or ogs.Transparency != 0
+            or ogs.DetailLevel != DB.ViewDetailLevel.Undefined
+        )
+
+        if has_override:
+            return True
+    except Exception:
+        return True
+
+    if isinstance(element, DB.Group):
+        return any(
+            has_view_specific_graphics(doc, view, member_id)
+            for member_id in element.GetMemberIds()
+        )
+
+    return False
 
 
 def valid_color(color):
@@ -1493,6 +1591,7 @@ def main():
                             DB.ViewDuplicateOption.Duplicate
                         )
                         dest_view = dest_doc.GetElement(destination_view_id)
+                        dest_view.Scale = src_legend.Scale
 
                         options = DB.CopyPasteOptions()
                         options.SetDuplicateTypeNamesHandler(CopyUseDestination())
@@ -1516,6 +1615,7 @@ def main():
                             copied_ids = [
                                 element_id for element_id in copied_collection
                             ]
+                            dest_doc.Regenerate()
 
                         pattern_maps = build_pattern_maps(dest_doc)
                         element_pairs = []
@@ -1546,7 +1646,15 @@ def main():
                             )
                             unmatched_source_ids.extend(unmatched_members)
 
+                        unmatched_without_graphics = 0
+
                         for unmatched_source_id in unmatched_source_ids:
+                            if not has_view_specific_graphics(
+                                SOURCE_DOC, src_legend, unmatched_source_id
+                            ):
+                                unmatched_without_graphics += 1
+                                continue
+
                             failed_override_count += 1
                             override_failure_rows.append(
                                 [
@@ -1561,6 +1669,14 @@ def main():
                                     "unambiguously; overrides were not "
                                     "transferred.",
                                 ]
+                            )
+
+                        if unmatched_without_graphics:
+                            logger.info(
+                                "Legend '%s': %s copied element(s) could not "
+                                "be matched but carry no overrides.",
+                                legend_name,
+                                unmatched_without_graphics,
                             )
 
                         (
@@ -1698,7 +1814,6 @@ def main():
                             dest_view,
                             new_name,
                         )
-                        dest_view.Scale = src_legend.Scale
                         all_legend_names.append(new_name)
 
                         commit_status = transaction.Commit()
